@@ -18,6 +18,7 @@ from contextlib import asynccontextmanager
 from typing import Optional, List, Dict, Any, Literal
 import webbrowser  # For automatic browser opening
 import threading  # For automatic browser opening
+from datetime import timedelta
 
 from fastapi import (
     FastAPI,
@@ -27,16 +28,15 @@ from fastapi import (
     UploadFile,
     Form,
     BackgroundTasks,
+    Depends,
+    status,
 )
-from fastapi.responses import (
-    HTMLResponse,
-    JSONResponse,
-    StreamingResponse,
-    FileResponse,
-)
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, FileResponse, RedirectResponse
+from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import Session
 
 # --- Internal Project Imports ---
 from config import (
@@ -58,7 +58,14 @@ from config import (
     get_full_config_for_template,
     get_audio_output_format,
 )
-
+from database import db_manager, User
+from auth import (
+    authenticate_user,
+    create_access_token,
+    get_current_active_user,
+    get_current_admin_user,
+    ACCESS_TOKEN_EXPIRE_MINUTES,
+)
 import engine  # TTS Engine interface
 from models import (  # Pydantic models
     CustomTTSRequest,
@@ -69,15 +76,14 @@ import utils  # Utility functions
 
 from pydantic import BaseModel, Field
 
-
+# --- OpenAI Compatible Request Model ---
 class OpenAISpeechRequest(BaseModel):
     model: str
     input_: str = Field(..., alias="input")
     voice: str
-    response_format: Literal["wav", "opus", "mp3"] = "wav"  # Add "mp3"
+    response_format: Literal["wav", "opus", "mp3"] = "wav"
     speed: float = 1.0
     seed: Optional[int] = None
-
 
 # --- Logging Configuration ---
 log_file_path_obj = get_log_file_path()
@@ -107,7 +113,6 @@ logger = logging.getLogger(__name__)
 # --- Global Variables & Application Setup ---
 startup_complete_event = threading.Event()  # For coordinating browser opening
 
-
 def _delayed_browser_open(host: str, port: int):
     """
     Waits for the startup_complete_event, then opens the web browser
@@ -129,7 +134,6 @@ def _delayed_browser_open(host: str, port: int):
     except Exception as e:
         logger.error(f"Failed to open browser automatically: {e}", exc_info=True)
 
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manages application startup and shutdown events."""
@@ -137,6 +141,7 @@ async def lifespan(app: FastAPI):
     try:
         logger.info(f"Configuration loaded. Log file at: {get_log_file_path()}")
 
+        # Create necessary directories
         paths_to_ensure = [
             get_output_path(),
             get_reference_audio_path(),
@@ -149,6 +154,14 @@ async def lifespan(app: FastAPI):
         for p in paths_to_ensure:
             p.mkdir(parents=True, exist_ok=True)
 
+        # Initialize database
+        try:
+            db_manager.create_tables()
+            logger.info("Database tables created successfully")
+        except Exception as e:
+            logger.error(f"Error creating database tables: {e}")
+
+        # Load TTS model
         if not engine.load_model():
             logger.critical(
                 "CRITICAL: TTS Model failed to load on startup. Server might not function correctly."
@@ -175,7 +188,6 @@ async def lifespan(app: FastAPI):
     finally:
         logger.info("TTS Server: Application shutdown sequence initiated...")
         logger.info("TTS Server: Application shutdown complete.")
-
 
 # --- FastAPI Application Instance ---
 app = FastAPI(
@@ -218,8 +230,185 @@ except RuntimeError as e_mount_outputs:
 
 templates = Jinja2Templates(directory=str(ui_static_path))
 
-# --- API Endpoints ---
+# --- Authentication Routes ---
+@app.post("/token", tags=["Authentication"])
+async def login_for_access_token(
+    form_data: OAuth2PasswordRequestForm = Depends(), 
+    db: Session = Depends(db_manager.get_db)
+):
+    """Login endpoint that returns JWT access token"""
+    user = await authenticate_user(db, form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user.email}, expires_delta=access_token_expires
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
 
+# --- Admin User Management Endpoints ---
+@app.post("/admin/users", tags=["Admin"], dependencies=[Depends(get_current_admin_user)])
+async def create_user(
+    email: str = Form(...), 
+    password: str = Form(...), 
+    subscription_months: int = Form(1),
+    monthly_char_limit: int = Form(1000000),
+    db: Session = Depends(db_manager.get_db)
+):
+    """Create a new user (admin only)"""
+    existing_user = db_manager.get_user_by_email(db, email)
+    if existing_user:
+        raise HTTPException(status_code=400, detail="User with this email already exists")
+    
+    user = db_manager.create_user(
+        db, email, password, is_admin=False, 
+        subscription_months=subscription_months,
+        monthly_char_limit=monthly_char_limit
+    )
+    return {"message": "User created successfully", "user_id": user.id}
+
+@app.get("/admin/users", tags=["Admin"], dependencies=[Depends(get_current_admin_user)])
+async def list_users(db: Session = Depends(db_manager.get_db)):
+    """List all users (admin only)"""
+    users = db_manager.get_all_users(db)
+    return [
+        {
+            "id": user.id,
+            "email": user.email,
+            "is_admin": user.is_admin,
+            "is_active": user.is_active,
+            "subscription_end_date": user.subscription_end_date,
+            "monthly_char_limit": user.monthly_char_limit,
+            "chars_used_today": user.chars_used_today,
+            "created_at": user.created_at
+        }
+        for user in users
+    ]
+
+@app.post("/admin/users/{user_id}/suspend", tags=["Admin"], dependencies=[Depends(get_current_admin_user)])
+async def suspend_user(user_id: int, db: Session = Depends(db_manager.get_db)):
+    """Suspend a user (admin only)"""
+    user = db_manager.update_user(db, user_id, is_active=False)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"message": "User suspended successfully"}
+
+@app.post("/admin/users/{user_id}/activate", tags=["Admin"], dependencies=[Depends(get_current_admin_user)])
+async def activate_user(user_id: int, db: Session = Depends(db_manager.get_db)):
+    """Activate a user (admin only)"""
+    user = db_manager.update_user(db, user_id, is_active=True)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"message": "User activated successfully"}
+
+@app.post("/admin/users/{user_id}/change_password", tags=["Admin"], dependencies=[Depends(get_current_admin_user)])
+async def change_password(
+    user_id: int, 
+    new_password: str = Form(...), 
+    db: Session = Depends(db_manager.get_db)
+):
+    """Change user password (admin only)"""
+    user = db_manager.update_user(db, user_id, password=new_password)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"message": "Password changed successfully"}
+
+@app.put("/admin/users/{user_id}", tags=["Admin"], dependencies=[Depends(get_current_admin_user)])
+async def update_user_details(
+    user_id: int,
+    email: Optional[str] = Form(None),
+    password: Optional[str] = Form(None),
+    monthly_char_limit: Optional[int] = Form(None),
+    subscription_months: Optional[int] = Form(None),
+    is_active: Optional[bool] = Form(None),
+    db: Session = Depends(db_manager.get_db)
+):
+    """Update user details (admin only) - allows updating any combination of fields"""
+    update_data = {}
+    
+    if email is not None:
+        # Check if email is already taken by another user
+        existing_user = db_manager.get_user_by_email(db, email)
+        if existing_user and existing_user.id != user_id:
+            raise HTTPException(status_code=400, detail="Email already exists")
+        update_data["email"] = email
+    
+    if password is not None:
+        update_data["password"] = password
+    
+    if monthly_char_limit is not None:
+        update_data["monthly_char_limit"] = monthly_char_limit
+    
+    if subscription_months is not None:
+        from datetime import datetime, timedelta
+        update_data["subscription_end_date"] = datetime.now() + timedelta(days=30 * subscription_months)
+    
+    if is_active is not None:
+        update_data["is_active"] = is_active
+    
+    if not update_data:
+        raise HTTPException(status_code=400, detail="No fields provided for update")
+    
+    user = db_manager.update_user(db, user_id, **update_data)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    return {
+        "message": "User updated successfully",
+        "user": {
+            "id": user.id,
+            "email": user.email,
+            "is_active": user.is_active,
+            "monthly_char_limit": user.monthly_char_limit,
+            "subscription_end_date": user.subscription_end_date
+        }
+    }
+
+@app.get("/admin/users/{user_id}", tags=["Admin"], dependencies=[Depends(get_current_admin_user)])
+async def get_user_details(user_id: int, db: Session = Depends(db_manager.get_db)):
+    """Get detailed user information (admin only)"""
+    user = db_manager.get_user_by_id(db, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    return {
+        "id": user.id,
+        "email": user.email,
+        "is_admin": user.is_admin,
+        "is_active": user.is_active,
+        "subscription_end_date": user.subscription_end_date,
+        "monthly_char_limit": user.monthly_char_limit,
+        "chars_used_today": user.chars_used_today,
+        "last_usage_date": user.last_usage_date,
+        "created_at": user.created_at,
+        "updated_at": user.updated_at
+    }
+
+@app.delete("/admin/users/{user_id}", tags=["Admin"], dependencies=[Depends(get_current_admin_user)])
+async def delete_user(user_id: int, db: Session = Depends(db_manager.get_db)):
+    """Delete a user (admin only)"""
+    success = db_manager.delete_user(db, user_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"message": "User deleted successfully"}
+
+# --- User Info Endpoint ---
+@app.get("/user/me", tags=["User"])
+async def get_current_user_info(current_user: User = Depends(get_current_active_user)):
+    """Get current user information"""
+    return {
+        "id": current_user.id,
+        "email": current_user.email,
+        "is_admin": current_user.is_admin,
+        "subscription_end_date": current_user.subscription_end_date,
+        "monthly_char_limit": current_user.monthly_char_limit,
+        "chars_used_today": current_user.chars_used_today,
+        "last_usage_date": current_user.last_usage_date
+    }
 
 # --- Main UI Route ---
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
@@ -235,7 +424,6 @@ async def get_web_ui(request: Request):
             "Please check server logs for more details.</p></body></html>",
             status_code=500,
         )
-
 
 # --- API Endpoint for Initial UI Data ---
 @app.get("/api/ui/initial-data", tags=["UI Helpers"])
@@ -287,7 +475,6 @@ async def get_ui_initial_data():
             status_code=500, detail="Failed to load initial data for UI."
         )
 
-
 # --- Configuration Management API Endpoints ---
 @app.post("/save_settings", response_model=UpdateStatusResponse, tags=["Configuration"])
 async def save_settings_endpoint(request: Request):
@@ -329,7 +516,6 @@ async def save_settings_endpoint(request: Request):
             detail=f"Internal server error during settings save: {str(e)}",
         )
 
-
 @app.post(
     "/reset_settings", response_model=UpdateStatusResponse, tags=["Configuration"]
 )
@@ -355,7 +541,6 @@ async def reset_settings_endpoint():
             detail=f"Internal server error during settings reset: {str(e)}",
         )
 
-
 @app.post(
     "/restart_server", response_model=UpdateStatusResponse, tags=["Configuration"]
 )
@@ -370,7 +555,6 @@ async def restart_server_endpoint():
     logger.warning(message)
     return UpdateStatusResponse(message=message, restart_needed=True)
 
-
 # --- UI Helper API Endpoints ---
 @app.get("/get_reference_files", response_model=List[str], tags=["UI Helpers"])
 async def get_reference_files_api():
@@ -383,7 +567,6 @@ async def get_reference_files_api():
         raise HTTPException(
             status_code=500, detail="Failed to retrieve reference audio files."
         )
-
 
 @app.get(
     "/get_predefined_voices", response_model=List[Dict[str, str]], tags=["UI Helpers"]
@@ -398,7 +581,6 @@ async def get_predefined_voices_api():
         raise HTTPException(
             status_code=500, detail="Failed to retrieve predefined voices list."
         )
-
 
 # --- File Upload Endpoints ---
 @app.post("/upload_reference", tags=["File Management"])
@@ -484,7 +666,6 @@ async def upload_reference_audio_endpoint(files: List[UploadFile] = File(...)):
         )
     return JSONResponse(content=response_data, status_code=status_code)
 
-
 @app.post("/upload_predefined_voice", tags=["File Management"])
 async def upload_predefined_voice_endpoint(files: List[UploadFile] = File(...)):
     """
@@ -569,10 +750,7 @@ async def upload_predefined_voice_endpoint(files: List[UploadFile] = File(...)):
         )
     return JSONResponse(content=response_data, status_code=status_code)
 
-
-# --- TTS Generation Endpoint ---
-
-
+# --- Protected TTS Generation Endpoint ---
 @app.post(
     "/tts",
     tags=["TTS Generation"],
@@ -585,6 +763,12 @@ async def upload_predefined_voice_endpoint(files: List[UploadFile] = File(...)):
         400: {
             "model": ErrorResponse,
             "description": "Invalid request parameters or input.",
+        },
+        401: {
+            "description": "Unauthorized",
+        },
+        403: {
+            "description": "Forbidden - usage limits exceeded or inactive user",
         },
         404: {
             "model": ErrorResponse,
@@ -601,13 +785,22 @@ async def upload_predefined_voice_endpoint(files: List[UploadFile] = File(...)):
     },
 )
 async def custom_tts_endpoint(
-    request: CustomTTSRequest, background_tasks: BackgroundTasks
+    request: CustomTTSRequest,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(db_manager.get_db),
 ):
     """
     Generates speech audio from text using specified parameters.
     Handles various voice modes (predefined, clone) and audio processing options.
     Returns audio as a stream (WAV or Opus).
     """
+    # Check usage limits
+    char_count = len(request.text)
+    allowed, message = db_manager.check_user_limits(db, current_user.id, char_count)
+    if not allowed:
+        raise HTTPException(status_code=403, detail=message)
+
     perf_monitor = utils.PerformanceMonitor(
         enabled=config_manager.get_bool("server.enable_performance_monitor", False)
     )
@@ -676,19 +869,13 @@ async def custom_tts_endpoint(
     perf_monitor.record("Parameters and voice path resolved")
 
     all_audio_segments_np: List[np.ndarray] = []
-    final_output_sample_rate = (
-        get_audio_sample_rate()
-    )  # Target SR for the final output file
-    engine_output_sample_rate: Optional[int] = (
-        None  # SR from the TTS engine (e.g., 24000 Hz)
-    )
+    final_output_sample_rate = get_audio_sample_rate()
+    engine_output_sample_rate: Optional[int] = None
 
     if request.split_text and len(request.text) > (
         request.chunk_size * 1.5 if request.chunk_size else 120 * 1.5
     ):
-        chunk_size_to_use = (
-            request.chunk_size if request.chunk_size is not None else 120
-        )
+        chunk_size_to_use = request.chunk_size if request.chunk_size is not None else 120
         logger.info(f"Splitting text into chunks of size ~{chunk_size_to_use}.")
         text_chunks = utils.chunk_text_by_sentences(request.text, chunk_size_to_use)
         perf_monitor.record(f"Text split into {len(text_chunks)} chunks")
@@ -762,9 +949,6 @@ async def custom_tts_endpoint(
                 )
                 perf_monitor.record(f"Speed factor applied to chunk {i+1}")
 
-            # ### MODIFICATION ###
-            # All other processing is REMOVED from the loop.
-            # We will process the final concatenated audio clip.
             processed_audio_np = current_processed_audio_tensor.cpu().numpy().squeeze()
             all_audio_segments_np.append(processed_audio_np)
 
@@ -788,8 +972,6 @@ async def custom_tts_endpoint(
         )
 
     try:
-        # ### MODIFICATION START ###
-        # First, concatenate all raw chunks into a single audio clip.
         final_audio_np = (
             np.concatenate(all_audio_segments_np)
             if len(all_audio_segments_np) > 1
@@ -797,7 +979,6 @@ async def custom_tts_endpoint(
         )
         perf_monitor.record("All audio chunks processed and concatenated")
 
-        # Now, apply all audio processing to the COMPLETE audio clip.
         if config_manager.get_bool("audio_processing.enable_silence_trimming", False):
             final_audio_np = utils.trim_lead_trail_silence(
                 final_audio_np, engine_output_sample_rate
@@ -820,7 +1001,6 @@ async def custom_tts_endpoint(
                 final_audio_np, engine_output_sample_rate
             )
             perf_monitor.record(f"Global unvoiced removal applied")
-        # ### MODIFICATION END ###
 
     except ValueError as e_concat:
         logger.error(f"Audio concatenation failed: {e_concat}", exc_info=True)
@@ -853,6 +1033,9 @@ async def custom_tts_endpoint(
             detail=f"Failed to encode audio to {output_format_str} or generated invalid audio.",
         )
 
+    # Update usage asynchronously
+    background_tasks.add_task(db_manager.update_usage, db, current_user.id, char_count)
+
     media_type = f"audio/{output_format_str}"
     timestamp_str = time.strftime("%Y%m%d_%H%M%S")
     suggested_filename_base = f"tts_output_{timestamp_str}"
@@ -870,9 +1053,20 @@ async def custom_tts_endpoint(
         io.BytesIO(encoded_audio_bytes), media_type=media_type, headers=headers
     )
 
-
+# --- OpenAI Compatible Endpoint ---
 @app.post("/v1/audio/speech", tags=["OpenAI Compatible"])
-async def openai_speech_endpoint(request: OpenAISpeechRequest):
+async def openai_speech_endpoint(
+    request: OpenAISpeechRequest,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(db_manager.get_db),
+):
+    """OpenAI-compatible speech generation endpoint"""
+    # Check usage limits
+    char_count = len(request.input_)
+    allowed, message = db_manager.check_user_limits(db, current_user.id, char_count)
+    if not allowed:
+        raise HTTPException(status_code=403, detail=message)
+
     # Determine the audio prompt path based on the voice parameter
     predefined_voices_path = get_predefined_voices_path(ensure_absolute=True)
     reference_audio_path = get_reference_audio_path(ensure_absolute=True)
@@ -938,6 +1132,11 @@ async def openai_speech_endpoint(request: OpenAISpeechRequest):
         if encoded_audio is None:
             raise HTTPException(status_code=500, detail="Failed to encode audio.")
 
+        # Update usage asynchronously
+        from fastapi import BackgroundTasks
+        background_tasks = BackgroundTasks()
+        background_tasks.add_task(db_manager.update_usage, db, current_user.id, char_count)
+
         # Determine the media type
         media_type = f"audio/{request.response_format}"
 
@@ -947,7 +1146,6 @@ async def openai_speech_endpoint(request: OpenAISpeechRequest):
     except Exception as e:
         logger.error(f"Error in openai_speech_endpoint: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
-
 
 # --- Main Execution ---
 if __name__ == "__main__":
@@ -970,3 +1168,5 @@ if __name__ == "__main__":
         workers=1,
         reload=False,
     )
+
+
