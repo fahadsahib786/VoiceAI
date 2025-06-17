@@ -54,11 +54,32 @@ def _reset_cuda_context():
     """
     try:
         if torch.cuda.is_available():
+            # Force clear all CUDA memory and reset context
             torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
             torch.cuda.synchronize()
+            # Reset random number generators
+            torch.cuda.manual_seed(42)
             logger.info("CUDA context reset successfully")
     except Exception as e:
         logger.warning(f"Failed to reset CUDA context: {e}")
+
+
+def _force_cpu_mode():
+    """
+    Forces the model to CPU mode and updates global state.
+    """
+    global chatterbox_model, model_device
+    
+    try:
+        if chatterbox_model and hasattr(chatterbox_model, 'to'):
+            chatterbox_model.to('cpu')
+        model_device = 'cpu'
+        logger.info("Forced model to CPU mode")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to force CPU mode: {e}")
+        return False
 
 
 def _test_cuda_functionality() -> bool:
@@ -246,12 +267,45 @@ def synthesize(
     )
 
     try:
-        # Reset CUDA context if using CUDA
-        if model_device == "cuda":
-            _reset_cuda_context()
-
-        # First attempt on current device
+        # For voice cloning mode, try CPU first to avoid CUDA indexing issues
+        if audio_prompt_path and model_device == "cuda":
+            logger.info("Voice cloning detected, attempting CPU generation first...")
+            original_device = model_device
+            
+            # Try CPU first for voice cloning
+            if _force_cpu_mode():
+                try:
+                    wav_tensor = chatterbox_model.generate(
+                        text=text,
+                        audio_prompt_path=audio_prompt_path,
+                        temperature=temperature,
+                        exaggeration=exaggeration,
+                        cfg_weight=cfg_weight,
+                    )
+                    logger.info("Successfully generated cloned voice on CPU")
+                    
+                    # Try to restore original device
+                    try:
+                        if hasattr(chatterbox_model, 'to'):
+                            chatterbox_model.to(original_device)
+                            model_device = original_device
+                    except Exception as move_error:
+                        logger.warning(f"Failed to move model back to {original_device}: {move_error}")
+                    
+                    return wav_tensor, chatterbox_model.sr
+                except Exception as cpu_error:
+                    logger.error(f"CPU voice cloning failed: {cpu_error}")
+                    # Restore device and try CUDA
+                    if hasattr(chatterbox_model, 'to'):
+                        chatterbox_model.to(original_device)
+                        model_device = original_device
+        
+        # Standard generation attempt (or fallback for failed CPU voice cloning)
         try:
+            # Reset CUDA context if using CUDA
+            if model_device == "cuda":
+                _reset_cuda_context()
+            
             wav_tensor = chatterbox_model.generate(
                 text=text,
                 audio_prompt_path=audio_prompt_path,
@@ -261,47 +315,27 @@ def synthesize(
             )
             logger.info(f"Successfully generated audio on {model_device}")
             return wav_tensor, chatterbox_model.sr
-
+            
         except Exception as first_error:
             logger.error(f"First attempt failed on {model_device}: {first_error}")
             
-            # If CUDA error, try CPU fallback
-            if model_device == "cuda" and ("CUDA" in str(first_error) or "cuda" in str(first_error).lower()):
-                logger.info("Attempting CPU fallback...")
-                try:
-                    # Store original device
-                    original_device = model_device
-                    model_device = "cpu"
-                    
-                    # Move model to CPU
-                    if hasattr(chatterbox_model, 'to'):
-                        chatterbox_model.to('cpu')
-                    
-                    wav_tensor = chatterbox_model.generate(
-                        text=text,
-                        audio_prompt_path=audio_prompt_path,
-                        temperature=temperature,
-                        exaggeration=exaggeration,
-                        cfg_weight=cfg_weight,
-                    )
-                    
-                    logger.info("Successfully generated audio on CPU")
-                    
-                    # Try to move back to original device
+            # If not already on CPU and error occurs, try CPU fallback
+            if model_device != "cpu":
+                logger.info("Attempting final CPU fallback...")
+                if _force_cpu_mode():
                     try:
-                        if hasattr(chatterbox_model, 'to'):
-                            chatterbox_model.to(original_device)
-                            model_device = original_device
-                    except Exception as move_error:
-                        logger.warning(f"Failed to move model back to {original_device}: {move_error}")
-                    
-                    return wav_tensor, chatterbox_model.sr
-                    
-                except Exception as cpu_error:
-                    logger.error(f"CPU fallback failed: {cpu_error}")
-                    model_device = original_device  # Restore device setting
+                        wav_tensor = chatterbox_model.generate(
+                            text=text,
+                            audio_prompt_path=audio_prompt_path,
+                            temperature=temperature,
+                            exaggeration=exaggeration,
+                            cfg_weight=cfg_weight,
+                        )
+                        logger.info("Successfully generated audio on CPU fallback")
+                        return wav_tensor, chatterbox_model.sr
+                    except Exception as cpu_error:
+                        logger.error(f"CPU fallback failed: {cpu_error}")
             
-            # If we get here, both attempts failed
             return None, None
 
     except Exception as e:
