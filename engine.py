@@ -48,6 +48,83 @@ def set_seed(seed_value: int):
         logger.warning("Continuing without seed setting...")
 
 
+def _optimize_cuda_memory(batch_size: Optional[int] = None):
+    """
+    Optimizes CUDA memory allocation and sets up efficient memory handling.
+    
+    Args:
+        batch_size: Optional batch size to optimize memory for.
+                   If provided, adjusts memory fraction accordingly.
+    """
+    try:
+        if torch.cuda.is_available():
+            # Enable memory caching for faster allocation
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+            
+            # Get GPU memory information
+            total_memory = torch.cuda.get_device_properties(0).total_memory
+            
+            # Calculate optimal memory fraction based on batch size
+            if batch_size is not None:
+                # Adjust memory fraction based on batch size
+                # Larger batch sizes need more memory headroom
+                memory_fraction = max(0.7, min(0.95, 1.0 - (batch_size * 0.05)))
+            else:
+                memory_fraction = 0.9  # Default to 90% utilization
+            
+            # Set memory allocation strategy
+            if hasattr(torch.cuda, 'memory_stats'):
+                torch.cuda.set_per_process_memory_fraction(memory_fraction)
+                torch.cuda.set_device(torch.cuda.current_device())
+                
+            # Enable TF32 for better performance on Ampere GPUs (like A5000)
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            
+            # Set optimal CUDNN flags
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cudnn.enabled = True
+            
+            # Set optimal memory allocator
+            if hasattr(torch.cuda, 'memory_allocator'):
+                torch.cuda.memory_allocator(size_t=64 * 1024)  # 64KB minimum allocation
+            
+            # Synchronize CUDA operations
+            torch.cuda.synchronize()
+            
+            logger.info(f"CUDA memory optimized (using {memory_fraction:.1%} of {total_memory / 1e9:.1f}GB)")
+            return True
+    except Exception as e:
+        logger.warning(f"Failed to optimize CUDA settings: {e}")
+        return False
+
+def _estimate_batch_size(text_length: int) -> int:
+    """
+    Estimates optimal batch size based on text length and available GPU memory.
+    """
+    if not torch.cuda.is_available():
+        return 1
+        
+    try:
+        # Get GPU memory information
+        free_memory = torch.cuda.get_device_properties(0).total_memory
+        free_memory_gb = free_memory / 1e9
+        
+        # Estimate batch size based on text length and available memory
+        # These values are heuristic and may need adjustment
+        if text_length < 100:
+            batch_size = min(8, int(free_memory_gb / 2))
+        elif text_length < 500:
+            batch_size = min(4, int(free_memory_gb / 3))
+        else:
+            batch_size = min(2, int(free_memory_gb / 4))
+            
+        return max(1, batch_size)
+    except Exception as e:
+        logger.warning(f"Error estimating batch size: {e}")
+        return 1
+
 def _reset_cuda_context():
     """
     Attempts to reset CUDA context to recover from CUDA errors.
@@ -58,11 +135,18 @@ def _reset_cuda_context():
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
             torch.cuda.synchronize()
+            
             # Reset random number generators
             torch.cuda.manual_seed(42)
+            
+            # Re-apply optimizations
+            _optimize_cuda_memory()
+            
             logger.info("CUDA context reset successfully")
+            return True
     except Exception as e:
         logger.warning(f"Failed to reset CUDA context: {e}")
+        return False
 
 
 def _force_cpu_mode():
@@ -120,9 +204,12 @@ def load_model() -> bool:
         return True
 
     try:
-        # Reset CUDA context before loading
+        # Apply CUDA optimizations before loading
         if torch.cuda.is_available():
-            _reset_cuda_context()
+            if not _optimize_cuda_memory():
+                logger.warning("Failed to optimize CUDA memory settings")
+            if not _reset_cuda_context():
+                logger.warning("Failed to reset CUDA context")
 
         # Determine processing device with robust CUDA detection
         device_setting = config_manager.get_string("tts_engine.device", "auto")
@@ -152,8 +239,24 @@ def load_model() -> bool:
 
         try:
             # First attempt: Load with selected device
-            chatterbox_model = ChatterboxTTS.from_pretrained(device=model_device)
+            with torch.cuda.amp.autocast(enabled=model_device=="cuda"):
+                chatterbox_model = ChatterboxTTS.from_pretrained(device=model_device)
             logger.info(f"Successfully loaded model on {model_device}")
+            
+            # Apply additional optimizations for CUDA
+            if model_device == "cuda":
+                # Enable gradient checkpointing if available
+                if hasattr(chatterbox_model, 'enable_gradient_checkpointing'):
+                    chatterbox_model.enable_gradient_checkpointing()
+                
+                # Move model to GPU with optimal memory settings
+                if hasattr(chatterbox_model, 'to'):
+                    chatterbox_model.to(
+                        model_device,
+                        non_blocking=True,
+                        memory_format=torch.channels_last
+                    )
+                
         except Exception as e:
             if model_device == "cuda":
                 logger.warning(f"Failed to load model on CUDA: {e}")
@@ -248,6 +351,15 @@ def synthesize(
         logger.error("TTS model is not ready for synthesis.")
         return None, None
 
+    # Validate inputs
+    if not text or not isinstance(text, str) or text.strip() == "":
+        logger.error("Invalid text input for synthesis.")
+        return None, None
+
+    if audio_prompt_path is not None and not isinstance(audio_prompt_path, str):
+        logger.error("Invalid audio_prompt_path input for synthesis.")
+        return None, None
+
     # Clamp parameters to valid ranges
     temperature = max(0.1, min(temperature, 1.0))
     exaggeration = max(0.0, min(exaggeration, 1.0))
@@ -267,63 +379,75 @@ def synthesize(
     )
 
     try:
-        # For voice cloning mode, try CPU first to avoid CUDA indexing issues
-        if audio_prompt_path and model_device == "cuda":
-            logger.info("Voice cloning detected, attempting CPU generation first...")
-            original_device = model_device
-            
-            # Try CPU first for voice cloning
-            if _force_cpu_mode():
-                try:
-                    wav_tensor = chatterbox_model.generate(
-                        text=text,
-                        audio_prompt_path=audio_prompt_path,
-                        temperature=temperature,
-                        exaggeration=exaggeration,
-                        cfg_weight=cfg_weight,
-                    )
-                    logger.info("Successfully generated cloned voice on CPU")
-                    
-                    # Try to restore original device
-                    try:
-                        if hasattr(chatterbox_model, 'to'):
-                            chatterbox_model.to(original_device)
-                            model_device = original_device
-                    except Exception as move_error:
-                        logger.warning(f"Failed to move model back to {original_device}: {move_error}")
-                    
-                    return wav_tensor, chatterbox_model.sr
-                except Exception as cpu_error:
-                    logger.error(f"CPU voice cloning failed: {cpu_error}")
-                    # Restore device and try CUDA
-                    if hasattr(chatterbox_model, 'to'):
-                        chatterbox_model.to(original_device)
-                        model_device = original_device
+        # Estimate optimal batch size based on text length
+        batch_size = _estimate_batch_size(len(text))
         
-        # Standard generation attempt (or fallback for failed CPU voice cloning)
-        try:
-            # Reset CUDA context if using CUDA
-            if model_device == "cuda":
-                _reset_cuda_context()
+        # Optimize CUDA memory with estimated batch size
+        if model_device == "cuda":
+            _optimize_cuda_memory(batch_size)
             
-            wav_tensor = chatterbox_model.generate(
-                text=text,
-                audio_prompt_path=audio_prompt_path,
-                temperature=temperature,
-                exaggeration=exaggeration,
-                cfg_weight=cfg_weight,
-            )
-            logger.info(f"Successfully generated audio on {model_device}")
-            return wav_tensor, chatterbox_model.sr
-            
-        except Exception as first_error:
-            logger.error(f"First attempt failed on {model_device}: {first_error}")
-            
-            # If not already on CPU and error occurs, try CPU fallback
-            if model_device != "cpu":
-                logger.info("Attempting final CPU fallback...")
-                if _force_cpu_mode():
+        # Use automatic mixed precision for faster GPU computation
+        with torch.cuda.amp.autocast(enabled=model_device=="cuda"):
+            try:
+                # Clear CUDA cache before generation
+                if model_device == "cuda":
+                    torch.cuda.empty_cache()
+                
+                # Generate with optimized settings
+                wav_tensor = chatterbox_model.generate(
+                    text=text,
+                    audio_prompt_path=audio_prompt_path,
+                    temperature=temperature,
+                    exaggeration=exaggeration,
+                    cfg_weight=cfg_weight,
+                )
+                
+                # Move output to CPU immediately to free GPU memory
+                if model_device == "cuda" and hasattr(wav_tensor, 'cpu'):
+                    wav_tensor = wav_tensor.cpu()
+                    torch.cuda.empty_cache()
+                
+                logger.info(f"Successfully generated audio on {model_device}")
+                return wav_tensor, chatterbox_model.sr
+                
+            except Exception as first_error:
+                error_msg = str(first_error).lower()
+                logger.error(f"First attempt failed on {model_device}: {first_error}")
+                
+                if model_device == "cuda":
+                    is_memory_error = any(x in error_msg for x in ['memory', 'cuda', 'gpu'])
+                    
+                    if is_memory_error:
+                        # Try with smaller batch size
+                        try:
+                            logger.info("Attempting with reduced memory usage...")
+                            _optimize_cuda_memory(batch_size=1)
+                            torch.cuda.empty_cache()
+                            
+                            wav_tensor = chatterbox_model.generate(
+                                text=text,
+                                audio_prompt_path=audio_prompt_path,
+                                temperature=temperature,
+                                exaggeration=exaggeration,
+                                cfg_weight=cfg_weight,
+                            )
+                            
+                            if hasattr(wav_tensor, 'cpu'):
+                                wav_tensor = wav_tensor.cpu()
+                                torch.cuda.empty_cache()
+                                
+                            logger.info("Successfully generated with reduced memory")
+                            return wav_tensor, chatterbox_model.sr
+                            
+                        except Exception as memory_error:
+                            logger.error(f"Reduced memory attempt failed: {memory_error}")
+                    
+                    # Try CUDA recovery
                     try:
+                        logger.info("Attempting CUDA recovery...")
+                        _reset_cuda_context()
+                        _optimize_cuda_memory(batch_size=1)
+                        
                         wav_tensor = chatterbox_model.generate(
                             text=text,
                             audio_prompt_path=audio_prompt_path,
@@ -331,12 +455,34 @@ def synthesize(
                             exaggeration=exaggeration,
                             cfg_weight=cfg_weight,
                         )
-                        logger.info("Successfully generated audio on CPU fallback")
+                        
+                        if hasattr(wav_tensor, 'cpu'):
+                            wav_tensor = wav_tensor.cpu()
+                            torch.cuda.empty_cache()
+                            
+                        logger.info("Successfully generated after CUDA reset")
                         return wav_tensor, chatterbox_model.sr
-                    except Exception as cpu_error:
-                        logger.error(f"CPU fallback failed: {cpu_error}")
-            
-            return None, None
+                        
+                    except Exception as cuda_error:
+                        logger.error(f"CUDA recovery failed: {cuda_error}")
+                        
+                        # Last resort: CPU fallback
+                        logger.info("Attempting CPU fallback...")
+                        if _force_cpu_mode():
+                            try:
+                                wav_tensor = chatterbox_model.generate(
+                                    text=text,
+                                    audio_prompt_path=audio_prompt_path,
+                                    temperature=temperature,
+                                    exaggeration=exaggeration,
+                                    cfg_weight=cfg_weight,
+                                )
+                                logger.info("Successfully generated audio on CPU")
+                                return wav_tensor, chatterbox_model.sr
+                            except Exception as cpu_error:
+                                logger.error(f"CPU fallback failed: {cpu_error}")
+                
+                return None, None
 
     except Exception as e:
         logger.error(f"Critical error during synthesis: {e}", exc_info=True)
