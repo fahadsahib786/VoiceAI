@@ -411,23 +411,49 @@ async def get_current_user_info(current_user: User = Depends(get_current_active_
     }
 
 # --- Main UI Route ---
+@app.get("/login", response_class=HTMLResponse, include_in_schema=False)
+async def get_login_page(request: Request):
+    """Serves the login page."""
+    return templates.TemplateResponse("login.html", {"request": request})
+
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
-async def get_web_ui(request: Request):
+async def get_web_ui(request: Request, current_user: User = Depends(get_current_active_user)):
     """Serves the main web interface (index.html)."""
     logger.info("Request received for main UI page ('/').")
     try:
-        return templates.TemplateResponse("index.html", {"request": request})
+        return templates.TemplateResponse("index.html", {
+            "request": request,
+            "user": {
+                "email": current_user.email,
+                "is_admin": current_user.is_admin,
+                "monthly_char_limit": current_user.monthly_char_limit,
+                "chars_used_today": current_user.chars_used_today
+            }
+        })
     except Exception as e_render:
         logger.error(f"Error rendering main UI page: {e_render}", exc_info=True)
-        return HTMLResponse(
-            "<html><body><h1>Internal Server Error</h1><p>Could not load the TTS interface. "
-            "Please check server logs for more details.</p></body></html>",
+        raise HTTPException(
             status_code=500,
+            detail="Could not load the TTS interface. Please check server logs for more details."
         )
+
+@app.get("/check-auth", tags=["Authentication"])
+async def check_auth(current_user: User = Depends(get_current_active_user)):
+    """Check if the current user is authenticated and return user info."""
+    return {
+        "authenticated": True,
+        "user": {
+            "email": current_user.email,
+            "is_admin": current_user.is_admin,
+            "monthly_char_limit": current_user.monthly_char_limit,
+            "chars_used_today": current_user.chars_used_today,
+            "subscription_end_date": current_user.subscription_end_date.isoformat() if current_user.subscription_end_date else None
+        }
+    }
 
 # --- API Endpoint for Initial UI Data ---
 @app.get("/api/ui/initial-data", tags=["UI Helpers"])
-async def get_ui_initial_data():
+async def get_ui_initial_data(current_user: User = Depends(get_current_active_user)):
     """
     Provides all necessary initial data for the UI to render,
     including configuration, file lists, and presets.
@@ -468,6 +494,13 @@ async def get_ui_initial_data():
             "predefined_voices": predefined_voices,
             "presets": loaded_presets,
             "initial_gen_result": initial_gen_result_placeholder,
+            "user": {
+                "email": current_user.email,
+                "is_admin": current_user.is_admin,
+                "monthly_char_limit": current_user.monthly_char_limit,
+                "chars_used_today": current_user.chars_used_today,
+                "subscription_end_date": current_user.subscription_end_date.isoformat() if current_user.subscription_end_date else None
+            }
         }
     except Exception as e:
         logger.error(f"Error preparing initial UI data for API: {e}", exc_info=True)

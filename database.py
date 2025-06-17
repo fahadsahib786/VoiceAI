@@ -112,16 +112,19 @@ class DBManager:
             return False, "Subscription has expired"
 
         # Reset daily usage if it's a new day
-        if user.last_usage_date.date() != datetime.now().date():
+        if user.last_usage_date and user.last_usage_date.date() != datetime.now().date():
             user.chars_used_today = 0
             user.last_usage_date = datetime.now()
+            db.commit()
 
-        # Check character limits
-        if char_count > 1000000:  # 1M characters per request limit
-            return False, "Request exceeds maximum character limit of 1M"
+        # Check character limits - single request limit of 200k
+        if char_count > 200000:
+            return False, "Request exceeds maximum character limit of 200,000 characters"
             
-        if user.chars_used_today + char_count > 10000000:  # 10M characters per day limit
-            return False, "Daily character limit exceeded"
+        # Check user's monthly character limit
+        if user.chars_used_today + char_count > user.monthly_char_limit:
+            remaining = user.monthly_char_limit - user.chars_used_today
+            return False, f"Monthly character limit exceeded. You have {remaining:,} characters remaining."
 
         return True, "OK"
 

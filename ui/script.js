@@ -111,6 +111,69 @@ document.addEventListener('DOMContentLoaded', async function () {
         return notificationDiv;
     }
 
+    // --- Authentication Handling ---
+    function getToken() {
+        return localStorage.getItem('access_token');
+    }
+
+    function setToken(token) {
+        localStorage.setItem('access_token', token);
+    }
+
+    function clearToken() {
+        localStorage.removeItem('access_token');
+    }
+
+    async function checkAuthentication() {
+        const token = getToken();
+        if (!token) {
+            window.location.href = '/login';
+            return false;
+        }
+        try {
+            const response = await fetch('/check-auth', {
+                headers: {
+                    'Authorization': `Bearer ${token}`
+                }
+            });
+            if (!response.ok) {
+                clearToken();
+                window.location.href = '/login';
+                return false;
+            }
+            const data = await response.json();
+            updateUserInfo(data.user);
+            return true;
+        } catch (error) {
+            clearToken();
+            window.location.href = '/login';
+            return false;
+        }
+    }
+
+    function updateUserInfo(user) {
+        const userInfoDiv = document.getElementById('user-info');
+        const userEmailSpan = document.getElementById('user-email');
+        const charsUsedSpan = document.getElementById('chars-used-today');
+        const monthlyLimitSpan = document.getElementById('monthly-char-limit');
+        if (userInfoDiv && userEmailSpan && charsUsedSpan && monthlyLimitSpan) {
+            userEmailSpan.textContent = user.email;
+            charsUsedSpan.textContent = user.chars_used_today.toLocaleString();
+            monthlyLimitSpan.textContent = user.monthly_char_limit.toLocaleString();
+            userInfoDiv.classList.remove('hidden');
+        }
+    }
+
+    function setupLogout() {
+        const logoutBtn = document.getElementById('logout-btn');
+        if (logoutBtn) {
+            logoutBtn.addEventListener('click', () => {
+                clearToken();
+                window.location.href = '/login';
+            });
+        }
+    }
+
     function formatTime(seconds) {
         const minutes = Math.floor(seconds / 60);
         const secs = Math.floor(seconds % 60).toString().padStart(2, '0');
@@ -159,9 +222,13 @@ document.addEventListener('DOMContentLoaded', async function () {
             theme: localStorage.getItem('uiTheme') || 'dark'
         };
         try {
+            const token = getToken();
             const response = await fetch('/save_settings', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: { 
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${token}`
+                },
                 body: JSON.stringify({ ui_state: stateToSave })
             });
             if (!response.ok) {
@@ -192,9 +259,11 @@ document.addEventListener('DOMContentLoaded', async function () {
         }
     }
 
-
     // --- Initial Application Setup ---
-    function initializeApplication() {
+    async function initializeApplication() {
+        const authenticated = await checkAuthentication();
+        if (!authenticated) return;
+
         const preferredTheme = localStorage.getItem('uiTheme') || currentUiState.theme || 'dark';
         applyTheme(preferredTheme);
         const pageTitle = currentConfig?.ui?.title || "TTS Server";
@@ -211,6 +280,7 @@ document.addEventListener('DOMContentLoaded', async function () {
         }
         updateSpeedFactorWarning(); // Initial check for speed factor warning
         attachStateSavingListeners();
+        setupLogout();
         const initialGenResult = currentConfig.initial_gen_result;
         if (initialGenResult && initialGenResult.outputUrl) {
             initializeWaveSurfer(initialGenResult.outputUrl, initialGenResult);
@@ -219,8 +289,18 @@ document.addEventListener('DOMContentLoaded', async function () {
 
     async function fetchInitialData() {
         try {
-            const response = await fetch('/api/ui/initial-data');
+            const token = getToken();
+            const response = await fetch('/api/ui/initial-data', {
+                headers: {
+                    'Authorization': `Bearer ${token}`
+                }
+            });
             if (!response.ok) {
+                if (response.status === 401) {
+                    clearToken();
+                    window.location.href = '/login';
+                    return;
+                }
                 const errorText = await response.text();
                 throw new Error(`Failed to fetch initial UI data: ${response.status} ${response.statusText}. Server response: ${errorText}`);
             }
@@ -233,6 +313,12 @@ document.addEventListener('DOMContentLoaded', async function () {
             hideChunkWarning = currentUiState.hide_chunk_warning || false;
             hideGenerationWarning = currentUiState.hide_generation_warning || false;
             currentVoiceMode = currentUiState.last_voice_mode || 'predefined';
+            
+            // Update user info from the response
+            if (data.user) {
+                updateUserInfo(data.user);
+            }
+            
             initializeApplication();
         } catch (error) {
             console.error("Error fetching initial data:", error);
@@ -556,12 +642,21 @@ document.addEventListener('DOMContentLoaded', async function () {
         const startTime = performance.now();
         const jsonData = getTTSFormData();
         try {
+            const token = getToken();
             const response = await fetch('/tts', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: { 
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${token}`
+                },
                 body: JSON.stringify(jsonData)
             });
             if (!response.ok) {
+                if (response.status === 401) {
+                    clearToken();
+                    window.location.href = '/login';
+                    return;
+                }
                 const errorResult = await response.json().catch(() => ({ detail: `HTTP error ${response.status}` }));
                 throw new Error(errorResult.detail || 'TTS generation failed.');
             }
@@ -697,7 +792,15 @@ document.addEventListener('DOMContentLoaded', async function () {
             if (Object.keys(configDataToSave).length === 0) { showNotification("No editable configuration values to save.", "info"); return; }
             updateConfigStatus(saveConfigBtn, configStatus, 'Saving configuration...', 'info', 0, false);
             try {
-                const response = await fetch('/save_settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(configDataToSave) });
+                const token = getToken();
+                const response = await fetch('/save_settings', { 
+                    method: 'POST', 
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${token}`
+                    }, 
+                    body: JSON.stringify(configDataToSave) 
+                });
                 const result = await response.json();
                 if (!response.ok) throw new Error(result.detail || 'Failed to save configuration');
                 updateConfigStatus(saveConfigBtn, configStatus, result.message || 'Configuration saved.', 'success', 5000);
@@ -720,7 +823,15 @@ document.addEventListener('DOMContentLoaded', async function () {
             };
             updateConfigStatus(saveGenDefaultsBtn, genDefaultsStatus, 'Saving generation defaults...', 'info', 0, false);
             try {
-                const response = await fetch('/save_settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ generation_defaults: genParams }) });
+                const token = getToken();
+                const response = await fetch('/save_settings', { 
+                    method: 'POST', 
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${token}`
+                    }, 
+                    body: JSON.stringify({ generation_defaults: genParams }) 
+                });
                 const result = await response.json();
                 if (!response.ok) throw new Error(result.detail || 'Failed to save generation defaults');
                 updateConfigStatus(saveGenDefaultsBtn, genDefaultsStatus, result.message || 'Generation defaults saved.', 'success', 5000);
@@ -737,7 +848,13 @@ document.addEventListener('DOMContentLoaded', async function () {
             if (!confirm("Are you sure you want to reset ALL settings to their initial defaults? This will affect config.yaml and UI preferences. This action cannot be undone.")) return;
             updateConfigStatus(resetSettingsBtn, configStatus, 'Resetting settings...', 'info', 0, false);
             try {
-                const response = await fetch('/reset_settings', { method: 'POST' });
+                const token = getToken();
+                const response = await fetch('/reset_settings', { 
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${token}`
+                    }
+                });
                 if (!response.ok) {
                     const errorResult = await response.json().catch(() => ({ detail: 'Failed to reset settings on server.' }));
                     throw new Error(errorResult.detail);
@@ -758,7 +875,13 @@ document.addEventListener('DOMContentLoaded', async function () {
             if (!confirm("Are you sure you want to restart the server?")) return;
             updateConfigStatus(restartServerBtn, configStatus, 'Attempting server restart...', 'processing', 0, false);
             try {
-                const response = await fetch('/restart_server', { method: 'POST' });
+                const token = getToken();
+                const response = await fetch('/restart_server', { 
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${token}`
+                    }
+                });
                 const result = await response.json();
                 if (!response.ok) throw new Error(result.detail || 'Server responded with error on restart command');
                 showNotification("Server restart initiated. Please wait a moment for the server to come back online, then refresh the page.", "info", 10000);
@@ -782,7 +905,19 @@ document.addEventListener('DOMContentLoaded', async function () {
         const formData = new FormData();
         for (const file of files) formData.append('files', file);
         try {
-            const response = await fetch(endpoint, { method: 'POST', body: formData });
+            const token = getToken();
+            const response = await fetch(endpoint, { 
+                method: 'POST', 
+                headers: {
+                    'Authorization': `Bearer ${token}`
+                },
+                body: formData 
+            });
+            if (response.status === 401) {
+                clearToken();
+                window.location.href = '/login';
+                return;
+            }
             const result = await response.json();
             if (uploadNotification) uploadNotification.remove();
             if (!response.ok) throw new Error(result.message || result.detail || `Upload failed with status ${response.status}`);
@@ -840,7 +975,17 @@ document.addEventListener('DOMContentLoaded', async function () {
             cloneRefreshButton.innerHTML = `<svg class="animate-spin h-5 w-5" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>`;
             cloneRefreshButton.disabled = true;
             try {
-                const response = await fetch('/get_reference_files');
+                const token = getToken();
+                const response = await fetch('/get_reference_files', {
+                    headers: {
+                        'Authorization': `Bearer ${token}`
+                    }
+                });
+                if (response.status === 401) {
+                    clearToken();
+                    window.location.href = '/login';
+                    return;
+                }
                 if (!response.ok) throw new Error('Failed to fetch reference files list');
                 const files = await response.json();
                 initialReferenceFiles = files;
@@ -863,7 +1008,17 @@ document.addEventListener('DOMContentLoaded', async function () {
             predefinedVoiceRefreshButton.innerHTML = `<svg class="animate-spin h-5 w-5" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>`;
             predefinedVoiceRefreshButton.disabled = true;
             try {
-                const response = await fetch('/get_predefined_voices');
+                const token = getToken();
+                const response = await fetch('/get_predefined_voices', {
+                    headers: {
+                        'Authorization': `Bearer ${token}`
+                    }
+                });
+                if (response.status === 401) {
+                    clearToken();
+                    window.location.href = '/login';
+                    return;
+                }
                 if (!response.ok) throw new Error('Failed to fetch predefined voices list');
                 const voices = await response.json();
                 initialPredefinedVoices = voices;

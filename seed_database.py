@@ -29,7 +29,7 @@ def seed_database():
                 email="admin@tts.local",
                 password="admin123",
                 is_admin=True,
-                subscription_months=999999,  # Permanent subscription
+                subscription_months=120,  # 10 years subscription
                 monthly_char_limit=1000000000  # 1B characters for admin
             )
             print(f"✅ Admin user created: {admin_user.email}")

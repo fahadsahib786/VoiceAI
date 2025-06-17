@@ -5,7 +5,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <!-- Title will be dynamically set by config, but provide a fallback -->
-    <title>Chatterbox TTS Server</title>
+    <title>Voice AI</title>
     <!-- Favicon links (ensure these files exist in your static assets if you use them) -->
     <!-- <link rel="apple-touch-icon" sizes="180x180" href="/static/apple-touch-icon.png"> -->
     <!-- <link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32x32.png"> -->
@@ -157,11 +157,17 @@
                 <div class="flex h-16 items-center justify-between">
                     <div class="flex items-center">
                         <div class="flex-shrink-0">
-                            <a href="/" id="app-title-link" class="title-link">TTS Server</a>
+                            <a href="/" id="app-title-link" class="title-link">Voice AI</a>
                         </div>
                     </div>
                     <div class="flex items-center space-x-3 sm:space-x-4">
                         <a href="/docs" target="_blank" class="nav-link">API Docs</a>
+                        <div id="user-info" class="text-sm text-slate-600 dark:text-slate-400 hidden">
+                            Logged in as <span id="user-email" class="font-semibold"></span> |
+                            Used <span id="chars-used-today" class="font-semibold"></span> /
+                            Limit <span id="monthly-char-limit" class="font-semibold"></span> chars
+                            <button id="logout-btn" class="ml-3 btn-secondary btn-sm">Logout</button>
+                        </div>
                         <button id="theme-toggle-btn" type="button" class="theme-switch-button"
                             title="Toggle light/dark mode">
                             <span class="sr-only">Toggle theme</span>
@@ -204,10 +210,10 @@
                                     recognized.
                                 </p>
                                 <div class="relative">
-                                    <textarea name="text" id="text" rows="5" maxlength="8192" class="textarea-base"
+                                    <textarea name="text" id="text" rows="5" maxlength="200000" class="textarea-base"
                                         placeholder="Enter text here..." required></textarea>
                                     <div class="absolute bottom-2.5 right-3 text-xs text-slate-500 dark:text-slate-400">
-                                        <span id="char-count">0</span> / 8192
+                                        <span id="char-count">0</span> / 200000
                                     </div>
                                 </div>
                             </div>
