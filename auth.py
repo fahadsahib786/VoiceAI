@@ -13,9 +13,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # JWT Configuration from environment variables
-SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-super-secret-jwt-key-change-this-in-production")
+SECRET_KEY = os.getenv("JWT_SECRET_KEY", "Ahjks982hkalakaDahaldhkasdlkkafjkd8766598afhkasdfjk")
 ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("JWT_ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("JWT_ACCESS_TOKEN_EXPIRE_MINUTES", "150"))
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
