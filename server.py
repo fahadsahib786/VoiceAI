@@ -36,6 +36,7 @@ from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
 from sqlalchemy.orm import Session
 
 # --- Internal Project Imports ---
@@ -205,6 +206,37 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
+
+# --- Exception Handlers ---
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Handle HTTP exceptions, especially authentication errors"""
+    if exc.status_code == 401:
+        # Check if this is an API request or a browser request
+        accept_header = request.headers.get("accept", "")
+        if "text/html" in accept_header and not request.url.path.startswith("/api/"):
+            # Browser request to a protected route - redirect to login
+            return RedirectResponse(url="/login", status_code=302)
+        else:
+            # API request - return JSON error
+            return JSONResponse(
+                status_code=exc.status_code,
+                content={"detail": exc.detail}
+            )
+    
+    # For other HTTP exceptions, return JSON
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail}
+    )
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Handle request validation errors"""
+    return JSONResponse(
+        status_code=422,
+        content={"detail": "Request validation error", "errors": exc.errors()}
+    )
 
 # --- Static Files and HTML Templates ---
 ui_static_path = Path(__file__).parent / "ui"
@@ -417,19 +449,11 @@ async def get_login_page(request: Request):
     return templates.TemplateResponse("login.html", {"request": request})
 
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
-async def get_web_ui(request: Request, current_user: User = Depends(get_current_active_user)):
-    """Serves the main web interface (index.html)."""
+async def get_web_ui(request: Request):
+    """Serves the main web interface (index.html) - authentication handled by frontend."""
     logger.info("Request received for main UI page ('/').")
     try:
-        return templates.TemplateResponse("index.html", {
-            "request": request,
-            "user": {
-                "email": current_user.email,
-                "is_admin": current_user.is_admin,
-                "monthly_char_limit": current_user.monthly_char_limit,
-                "chars_used_today": current_user.chars_used_today
-            }
-        })
+        return templates.TemplateResponse("index.html", {"request": request})
     except Exception as e_render:
         logger.error(f"Error rendering main UI page: {e_render}", exc_info=True)
         raise HTTPException(
