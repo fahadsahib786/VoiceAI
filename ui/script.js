@@ -642,6 +642,11 @@ document.addEventListener('DOMContentLoaded', async function () {
         const startTime = performance.now();
         const jsonData = getTTSFormData();
         try {
+            // Update loading status to show generation is in progress
+            if (loadingStatusText) {
+                loadingStatusText.textContent = 'Generating audio... Please wait.';
+            }
+
             const token = getToken();
             const response = await fetch('/tts', {
                 method: 'POST',
@@ -660,15 +665,42 @@ document.addEventListener('DOMContentLoaded', async function () {
                 const errorResult = await response.json().catch(() => ({ detail: `HTTP error ${response.status}` }));
                 throw new Error(errorResult.detail || 'TTS generation failed.');
             }
+
+            // Update loading status to show audio is being processed
+            if (loadingStatusText) {
+                loadingStatusText.textContent = 'Processing audio... Please wait.';
+            }
+
             const audioBlob = await response.blob();
             const endTime = performance.now();
             const genTime = ((endTime - startTime) / 1000).toFixed(2);
             const filenameFromServer = response.headers.get('Content-Disposition')?.split('filename=')[1]?.replace(/"/g, '') || 'generated_audio.wav';
+            
+            // Create a promise that resolves when the audio is loaded
+            const audioLoadPromise = new Promise((resolve, reject) => {
+                const audio = new Audio();
+                audio.src = URL.createObjectURL(audioBlob);
+                audio.onloadeddata = () => resolve();
+                audio.onerror = () => reject(new Error('Failed to load audio'));
+            });
+
+            // Update loading status to show audio is being loaded
+            if (loadingStatusText) {
+                loadingStatusText.textContent = 'Loading audio player... Please wait.';
+            }
+
+            // Wait for audio to load before proceeding
+            await audioLoadPromise;
+
             const resultDetails = {
-                outputUrl: URL.createObjectURL(audioBlob), filename: filenameFromServer, genTime: genTime,
-                submittedVoiceMode: jsonData.voice_mode, submittedPredefinedVoice: jsonData.predefined_voice_id,
+                outputUrl: URL.createObjectURL(audioBlob),
+                filename: filenameFromServer,
+                genTime: genTime,
+                submittedVoiceMode: jsonData.voice_mode,
+                submittedPredefinedVoice: jsonData.predefined_voice_id,
                 submittedCloneFile: jsonData.reference_audio_filename
             };
+
             initializeWaveSurfer(resultDetails.outputUrl, resultDetails);
             showNotification('Audio generated successfully!', 'success');
         } catch (error) {
