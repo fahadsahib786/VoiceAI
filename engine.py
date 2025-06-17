@@ -31,13 +31,34 @@ def set_seed(seed_value: int):
     Sets the seed for torch, random, and numpy for reproducibility.
     This is called if a non-zero seed is provided for generation.
     """
-    torch.manual_seed(seed_value)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed_value)
-        torch.cuda.manual_seed_all(seed_value)  # if using multi-GPU
-    random.seed(seed_value)
-    np.random.seed(seed_value)
-    logger.info(f"Global seed set to: {seed_value}")
+    try:
+        torch.manual_seed(seed_value)
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.manual_seed(seed_value)
+                torch.cuda.manual_seed_all(seed_value)  # if using multi-GPU
+            except RuntimeError as cuda_error:
+                logger.warning(f"Failed to set CUDA seed due to CUDA error: {cuda_error}")
+                logger.warning("Continuing with CPU-only seed setting...")
+        random.seed(seed_value)
+        np.random.seed(seed_value)
+        logger.info(f"Global seed set to: {seed_value}")
+    except Exception as e:
+        logger.error(f"Failed to set seed: {e}")
+        logger.warning("Continuing without seed setting...")
+
+
+def _reset_cuda_context():
+    """
+    Attempts to reset CUDA context to recover from CUDA errors.
+    """
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            logger.info("CUDA context reset successfully")
+    except Exception as e:
+        logger.warning(f"Failed to reset CUDA context: {e}")
 
 
 def _test_cuda_functionality() -> bool:
@@ -51,6 +72,9 @@ def _test_cuda_functionality() -> bool:
         return False
 
     try:
+        # Try to reset CUDA context first
+        _reset_cuda_context()
+        
         test_tensor = torch.tensor([1.0])
         test_tensor = test_tensor.cuda()
         test_tensor = test_tensor.cpu()
@@ -174,7 +198,7 @@ def synthesize(
     seed: int = 0,
 ) -> Tuple[Optional[torch.Tensor], Optional[int]]:
     """
-    Synthesizes audio from text using the loaded TTS model.
+    Synthesizes audio from text using the loaded TTS model with enhanced error handling.
 
     Args:
         text: The text to synthesize.
@@ -195,35 +219,92 @@ def synthesize(
         logger.error("TTS model is not loaded. Cannot synthesize audio.")
         return None, None
 
+    # Set seed globally if a specific seed value is provided and is non-zero.
+    if seed != 0:
+        logger.info(f"Applying user-provided seed for generation: {seed}")
+        set_seed(seed)
+    else:
+        logger.info(
+            "Using default (potentially random) generation behavior as seed is 0."
+        )
+
+    logger.debug(
+        f"Synthesizing with params: audio_prompt='{audio_prompt_path}', temp={temperature}, "
+        f"exag={exaggeration}, cfg_weight={cfg_weight}, seed_applied_globally_if_nonzero={seed}"
+    )
+
     try:
-        # Set seed globally if a specific seed value is provided and is non-zero.
-        if seed != 0:
-            logger.info(f"Applying user-provided seed for generation: {seed}")
-            set_seed(seed)
-        else:
-            logger.info(
-                "Using default (potentially random) generation behavior as seed is 0."
-            )
-
-        logger.debug(
-            f"Synthesizing with params: audio_prompt='{audio_prompt_path}', temp={temperature}, "
-            f"exag={exaggeration}, cfg_weight={cfg_weight}, seed_applied_globally_if_nonzero={seed}"
-        )
-
-        # Call the core model's generate method
-        wav_tensor = chatterbox_model.generate(
-            text=text,
-            audio_prompt_path=audio_prompt_path,
-            temperature=temperature,
-            exaggeration=exaggeration,
-            cfg_weight=cfg_weight,
-        )
-
-        # The ChatterboxTTS.generate method already returns a CPU tensor.
-        return wav_tensor, chatterbox_model.sr
-
+        # Reset CUDA context before generation
+        if model_device == "cuda":
+            _reset_cuda_context()
+            
+        # Ensure we're in eval mode and no gradients are being calculated
+        chatterbox_model.eval()
+        with torch.no_grad():
+            try:
+                # First attempt: Try with current device settings
+                wav_tensor = chatterbox_model.generate(
+                    text=text,
+                    audio_prompt_path=audio_prompt_path,
+                    temperature=max(0.1, min(temperature, 1.0)),
+                    exaggeration=max(0.0, min(exaggeration, 1.0)),
+                    cfg_weight=max(0.0, min(cfg_weight, 2.0)),
+                )
+                return wav_tensor, chatterbox_model.sr
+                
+            except RuntimeError as cuda_error:
+                if "CUDA" in str(cuda_error):
+                    logger.error(f"CUDA error during synthesis: {cuda_error}")
+                    logger.info("Attempting recovery steps...")
+                    
+                    # Step 1: Try resetting CUDA context
+                    _reset_cuda_context()
+                    
+                    try:
+                        # Second attempt: Try again after CUDA reset
+                        wav_tensor = chatterbox_model.generate(
+                            text=text,
+                            audio_prompt_path=audio_prompt_path,
+                            temperature=max(0.1, min(temperature, 1.0)),
+                            exaggeration=max(0.0, min(exaggeration, 1.0)),
+                            cfg_weight=max(0.0, min(cfg_weight, 2.0)),
+                        )
+                        logger.info("Successfully generated after CUDA reset")
+                        return wav_tensor, chatterbox_model.sr
+                        
+                    except Exception:
+                        logger.info("CUDA reset didn't help, attempting CPU fallback...")
+                        
+                        # Step 2: Try CPU fallback
+                        try:
+                            if hasattr(chatterbox_model, 'to'):
+                                original_device = next(chatterbox_model.parameters()).device
+                                chatterbox_model.to('cpu')
+                                
+                            wav_tensor = chatterbox_model.generate(
+                                text=text,
+                                audio_prompt_path=audio_prompt_path,
+                                temperature=max(0.1, min(temperature, 1.0)),
+                                exaggeration=max(0.0, min(exaggeration, 1.0)),
+                                cfg_weight=max(0.0, min(cfg_weight, 2.0)),
+                            )
+                            
+                            # Move model back to original device
+                            if hasattr(chatterbox_model, 'to'):
+                                chatterbox_model.to(original_device)
+                                
+                            logger.info("Successfully generated audio using CPU fallback")
+                            return wav_tensor, chatterbox_model.sr
+                            
+                        except Exception as fallback_error:
+                            logger.error(f"CPU fallback also failed: {fallback_error}")
+                            return None, None
+                else:
+                    logger.error(f"Non-CUDA runtime error during synthesis: {cuda_error}")
+                    return None, None
+                    
     except Exception as e:
-        logger.error(f"Error during TTS synthesis: {e}", exc_info=True)
+        logger.error(f"Unexpected error during synthesis: {e}", exc_info=True)
         return None, None
 
 
