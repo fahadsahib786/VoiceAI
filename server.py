@@ -190,6 +190,26 @@ async def lifespan(app: FastAPI):
         logger.info("TTS Server: Application shutdown sequence initiated...")
         logger.info("TTS Server: Application shutdown complete.")
 
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
+
+class GlobalExceptionMiddleware(BaseHTTPMiddleware):
+    """Middleware to catch all unhandled exceptions and return JSON responses."""
+    
+    async def dispatch(self, request, call_next):
+        try:
+            response = await call_next(request)
+            return response
+        except Exception as e:
+            logger.error(f"Unhandled exception: {str(e)}", exc_info=True)
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "detail": "An internal server error occurred",
+                    "error": str(e)
+                }
+            )
+
 # --- FastAPI Application Instance ---
 app = FastAPI(
     title=get_ui_title(),
@@ -198,7 +218,11 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# --- CORS Middleware ---
+# --- Middleware Stack ---
+# Global exception handler must be first
+app.add_middleware(GlobalExceptionMiddleware)
+
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
