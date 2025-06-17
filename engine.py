@@ -86,9 +86,7 @@ def _test_cuda_functionality() -> bool:
 
 def load_model() -> bool:
     """
-    Loads the TTS model.
-    This version directly attempts to load from the Hugging Face repository (or its cache)
-    using `from_pretrained`, bypassing the local `paths.model_cache` directory.
+    Loads the TTS model with enhanced device handling and error recovery.
     Updates global variables `chatterbox_model`, `MODEL_LOADED`, and `model_device`.
 
     Returns:
@@ -101,91 +99,101 @@ def load_model() -> bool:
         return True
 
     try:
-        # Determine processing device with robust CUDA detection and intelligent fallback
-        device_setting = config_manager.get_string("tts_engine.device", "auto")
+        # Reset CUDA context before loading
+        if torch.cuda.is_available():
+            _reset_cuda_context()
 
-        if device_setting == "auto":
+        # Determine processing device with robust CUDA detection
+        device_setting = config_manager.get_string("tts_engine.device", "auto")
+        resolved_device_str = "cpu"  # Default to CPU
+
+        if device_setting in ["auto", "cuda"]:
             if _test_cuda_functionality():
                 resolved_device_str = "cuda"
                 logger.info("CUDA functionality test passed. Using CUDA.")
             else:
-                resolved_device_str = "cpu"
-                logger.info("CUDA not functional or not available. Using CPU.")
-
-        elif device_setting == "cuda":
-            if _test_cuda_functionality():
-                resolved_device_str = "cuda"
-                logger.info("CUDA requested and functional. Using CUDA.")
-            else:
-                resolved_device_str = "cpu"
                 logger.warning(
-                    "CUDA was requested in config but functionality test failed. "
-                    "PyTorch may not be compiled with CUDA support. "
-                    "Automatically falling back to CPU."
+                    "CUDA not functional or not available. Using CPU."
+                    if device_setting == "auto"
+                    else "CUDA was requested but functionality test failed. Using CPU."
                 )
-
-        elif device_setting == "cpu":
-            resolved_device_str = "cpu"
-            logger.info("CPU device explicitly requested in config. Using CPU.")
-
-        else:
-            logger.warning(
-                f"Invalid device setting '{device_setting}' in config. "
-                f"Defaulting to auto-detection."
-            )
-            resolved_device_str = "cuda" if _test_cuda_functionality() else "cpu"
-            logger.info(f"Auto-detection resolved to: {resolved_device_str}")
+        elif device_setting != "cpu":
+            logger.warning(f"Invalid device setting '{device_setting}'. Using CPU.")
 
         model_device = resolved_device_str
         logger.info(f"Final device selection: {model_device}")
 
-        # Get configured model_repo_id for logging and context,
-        # though from_pretrained might use its own internal default if not overridden.
-        model_repo_id_config = config_manager.get_string(
+        # Get model repo ID for logging
+        model_repo_id = config_manager.get_string(
             "model.repo_id", "ResembleAI/chatterbox"
         )
+        logger.info(f"Loading model from: {model_repo_id}")
 
-        logger.info(
-            f"Attempting to load model directly using from_pretrained (expected from Hugging Face repository: {model_repo_id_config} or library default)."
-        )
         try:
-            # Directly use from_pretrained. This will utilize the standard Hugging Face cache.
-            # The ChatterboxTTS.from_pretrained method handles downloading if the model is not in the cache.
+            # First attempt: Load with selected device
             chatterbox_model = ChatterboxTTS.from_pretrained(device=model_device)
-            # The actual repo ID used by from_pretrained is often internal to the library,
-            # but logging the configured one provides user context.
-            logger.info(
-                f"Successfully loaded TTS model using from_pretrained on {model_device} (expected from '{model_repo_id_config}' or library default)."
-            )
-        except Exception as e_hf:
-            logger.error(
-                f"Failed to load model using from_pretrained (expected from '{model_repo_id_config}' or library default): {e_hf}",
-                exc_info=True,
-            )
-            chatterbox_model = None
-            MODEL_LOADED = False
+            logger.info(f"Successfully loaded model on {model_device}")
+        except Exception as e:
+            if model_device == "cuda":
+                logger.warning(f"Failed to load model on CUDA: {e}")
+                logger.info("Attempting CPU fallback for model loading...")
+                try:
+                    # CPU fallback attempt
+                    model_device = "cpu"
+                    chatterbox_model = ChatterboxTTS.from_pretrained(device="cpu")
+                    logger.info("Successfully loaded model on CPU")
+                except Exception as cpu_e:
+                    logger.error(f"CPU fallback also failed: {cpu_e}")
+                    raise
+            else:
+                raise
+
+        if not chatterbox_model:
+            logger.error("Model loading completed but model is None")
             return False
 
         MODEL_LOADED = True
-        if chatterbox_model:
-            logger.info(
-                f"TTS Model loaded successfully on {model_device}. Engine sample rate: {chatterbox_model.sr} Hz."
-            )
-        else:
-            logger.error(
-                "Model loading sequence completed, but chatterbox_model is None. This indicates an unexpected issue."
-            )
-            MODEL_LOADED = False
-            return False
-
+        logger.info(f"TTS Model loaded successfully. Sample rate: {chatterbox_model.sr} Hz")
         return True
 
     except Exception as e:
-        logger.error(
-            f"An unexpected error occurred during model loading: {e}", exc_info=True
-        )
+        logger.error(f"Failed to load model: {e}", exc_info=True)
         chatterbox_model = None
         MODEL_LOADED = False
+        model_device = None
+        return False
+
+
+def _ensure_model_ready():
+    """
+    Ensures the model is properly initialized and ready for generation.
+    Returns True if model is ready, False otherwise.
+    """
+    global chatterbox_model, model_device
+    
+    if not MODEL_LOADED or chatterbox_model is None:
+        logger.error("TTS model is not loaded")
+        return False
+        
+    try:
+        # Basic attribute checks
+        required_attrs = ['generate', 'sr']
+        for attr in required_attrs:
+            if not hasattr(chatterbox_model, attr):
+                logger.error(f"Model missing required attribute: {attr}")
+                return False
+        
+        # Device check and correction if needed
+        if model_device == "cuda" and not torch.cuda.is_available():
+            logger.warning("CUDA device set but not available, falling back to CPU")
+            model_device = "cpu"
+            if hasattr(chatterbox_model, 'to'):
+                chatterbox_model.to('cpu')
+                
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error checking model state: {e}")
         return False
 
 
@@ -203,108 +211,101 @@ def synthesize(
     Args:
         text: The text to synthesize.
         audio_prompt_path: Path to an audio file for voice cloning or predefined voice.
-        temperature: Controls randomness in generation.
-        exaggeration: Controls expressiveness.
-        cfg_weight: Classifier-Free Guidance weight.
-        seed: Random seed for generation. If 0, default randomness is used.
-              If non-zero, a global seed is set for reproducibility.
+        temperature: Controls randomness in generation (0.1 to 1.0).
+        exaggeration: Controls expressiveness (0.0 to 1.0).
+        cfg_weight: Classifier-Free Guidance weight (0.0 to 2.0).
+        seed: Random seed for generation. If 0, uses random seed.
 
     Returns:
         A tuple containing the audio waveform (torch.Tensor) and the sample rate (int),
         or (None, None) if synthesis fails.
     """
-    global chatterbox_model
+    global chatterbox_model, model_device
 
-    if not MODEL_LOADED or chatterbox_model is None:
-        logger.error("TTS model is not loaded. Cannot synthesize audio.")
+    # Check if model is ready for generation
+    if not _ensure_model_ready():
+        logger.error("TTS model is not ready for synthesis.")
         return None, None
 
-    # Set seed globally if a specific seed value is provided and is non-zero.
-    if seed != 0:
-        logger.info(f"Applying user-provided seed for generation: {seed}")
-        set_seed(seed)
-    else:
-        logger.info(
-            "Using default (potentially random) generation behavior as seed is 0."
-        )
+    # Clamp parameters to valid ranges
+    temperature = max(0.1, min(temperature, 1.0))
+    exaggeration = max(0.0, min(exaggeration, 1.0))
+    cfg_weight = max(0.0, min(cfg_weight, 2.0))
 
+    # Set seed if provided
+    if seed != 0:
+        try:
+            set_seed(seed)
+        except Exception as e:
+            logger.warning(f"Failed to set seed {seed}: {e}. Using random seed.")
+
+    logger.info(f"Starting synthesis with device: {model_device}")
     logger.debug(
-        f"Synthesizing with params: audio_prompt='{audio_prompt_path}', temp={temperature}, "
-        f"exag={exaggeration}, cfg_weight={cfg_weight}, seed_applied_globally_if_nonzero={seed}"
+        f"Parameters: temp={temperature}, exag={exaggeration}, "
+        f"cfg={cfg_weight}, seed={seed}, prompt='{audio_prompt_path}'"
     )
 
     try:
-        # Reset CUDA context before generation
+        # Reset CUDA context if using CUDA
         if model_device == "cuda":
             _reset_cuda_context()
+
+        # First attempt on current device
+        try:
+            wav_tensor = chatterbox_model.generate(
+                text=text,
+                audio_prompt_path=audio_prompt_path,
+                temperature=temperature,
+                exaggeration=exaggeration,
+                cfg_weight=cfg_weight,
+            )
+            logger.info(f"Successfully generated audio on {model_device}")
+            return wav_tensor, chatterbox_model.sr
+
+        except Exception as first_error:
+            logger.error(f"First attempt failed on {model_device}: {first_error}")
             
-        # Ensure we're in eval mode and no gradients are being calculated
-        chatterbox_model.eval()
-        with torch.no_grad():
-            try:
-                # First attempt: Try with current device settings
-                wav_tensor = chatterbox_model.generate(
-                    text=text,
-                    audio_prompt_path=audio_prompt_path,
-                    temperature=max(0.1, min(temperature, 1.0)),
-                    exaggeration=max(0.0, min(exaggeration, 1.0)),
-                    cfg_weight=max(0.0, min(cfg_weight, 2.0)),
-                )
-                return wav_tensor, chatterbox_model.sr
-                
-            except RuntimeError as cuda_error:
-                if "CUDA" in str(cuda_error):
-                    logger.error(f"CUDA error during synthesis: {cuda_error}")
-                    logger.info("Attempting recovery steps...")
+            # If CUDA error, try CPU fallback
+            if model_device == "cuda" and ("CUDA" in str(first_error) or "cuda" in str(first_error).lower()):
+                logger.info("Attempting CPU fallback...")
+                try:
+                    # Store original device
+                    original_device = model_device
+                    model_device = "cpu"
                     
-                    # Step 1: Try resetting CUDA context
-                    _reset_cuda_context()
+                    # Move model to CPU
+                    if hasattr(chatterbox_model, 'to'):
+                        chatterbox_model.to('cpu')
                     
+                    wav_tensor = chatterbox_model.generate(
+                        text=text,
+                        audio_prompt_path=audio_prompt_path,
+                        temperature=temperature,
+                        exaggeration=exaggeration,
+                        cfg_weight=cfg_weight,
+                    )
+                    
+                    logger.info("Successfully generated audio on CPU")
+                    
+                    # Try to move back to original device
                     try:
-                        # Second attempt: Try again after CUDA reset
-                        wav_tensor = chatterbox_model.generate(
-                            text=text,
-                            audio_prompt_path=audio_prompt_path,
-                            temperature=max(0.1, min(temperature, 1.0)),
-                            exaggeration=max(0.0, min(exaggeration, 1.0)),
-                            cfg_weight=max(0.0, min(cfg_weight, 2.0)),
-                        )
-                        logger.info("Successfully generated after CUDA reset")
-                        return wav_tensor, chatterbox_model.sr
-                        
-                    except Exception:
-                        logger.info("CUDA reset didn't help, attempting CPU fallback...")
-                        
-                        # Step 2: Try CPU fallback
-                        try:
-                            if hasattr(chatterbox_model, 'to'):
-                                original_device = next(chatterbox_model.parameters()).device
-                                chatterbox_model.to('cpu')
-                                
-                            wav_tensor = chatterbox_model.generate(
-                                text=text,
-                                audio_prompt_path=audio_prompt_path,
-                                temperature=max(0.1, min(temperature, 1.0)),
-                                exaggeration=max(0.0, min(exaggeration, 1.0)),
-                                cfg_weight=max(0.0, min(cfg_weight, 2.0)),
-                            )
-                            
-                            # Move model back to original device
-                            if hasattr(chatterbox_model, 'to'):
-                                chatterbox_model.to(original_device)
-                                
-                            logger.info("Successfully generated audio using CPU fallback")
-                            return wav_tensor, chatterbox_model.sr
-                            
-                        except Exception as fallback_error:
-                            logger.error(f"CPU fallback also failed: {fallback_error}")
-                            return None, None
-                else:
-                    logger.error(f"Non-CUDA runtime error during synthesis: {cuda_error}")
-                    return None, None
+                        if hasattr(chatterbox_model, 'to'):
+                            chatterbox_model.to(original_device)
+                            model_device = original_device
+                    except Exception as move_error:
+                        logger.warning(f"Failed to move model back to {original_device}: {move_error}")
                     
+                    return wav_tensor, chatterbox_model.sr
+                    
+                except Exception as cpu_error:
+                    logger.error(f"CPU fallback failed: {cpu_error}")
+                    model_device = original_device  # Restore device setting
+            
+            # If we get here, both attempts failed
+            return None, None
+
     except Exception as e:
-        logger.error(f"Unexpected error during synthesis: {e}", exc_info=True)
+        logger.error(f"Critical error during synthesis: {e}", exc_info=True)
         return None, None
 
 
