@@ -13,7 +13,6 @@ build/
 
 # Ignore IDE/Editor specific files
 .idea/
-.vscode/
 *.swp
 *.swo
 
@@ -22,6 +21,7 @@ build/
 Thumbs.db
 
 # Ignore virtual environment directories
+temp_auto_push.bat
 .venv/
 venv/
 */.venv/
@@ -46,3 +46,5 @@ htmlcov/
 
 # Ignore log files
 *.log
+.gitignore
+temp_interactive_push.bat
